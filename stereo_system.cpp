@@ -2,16 +2,17 @@
 
 StereoSystem createBlenderStereoSystem(
     cv::Point3f leftCameraPos,  // position of the left camera in Blender world
-    double baseline,            // distance between cameras in meters (along Blender X)
-    double FOV,
+    float baseline,            // distance between cameras in meters (along Blender X)
+    float FOV,
     cv::Size imageSize,
-    cv::Point2d principalPoint
+    cv::Point2f principalPoint
 ){
     StereoSystem ss;
     ss.imageSize = imageSize;
 
     // --- Intrinsics ---
     double fx = (imageSize.width / 2.0) / std::tan((FOV * CV_PI / 180.0) / 2.0);
+    fx *= 1.008;
     double fy = fx; // square pixels assumption
     if (principalPoint.x < 0) principalPoint.x = imageSize.width / 2.0;
     if (principalPoint.y < 0) principalPoint.y = imageSize.height / 2.0;
@@ -214,4 +215,144 @@ cv::Point3f triangulatePoint(cv::Point2f leftPoint, cv::Point2f rightPoint, cons
     );
 
     return point3f;  // No sign flip needed unless your coordinate system requires it
+}
+
+void getRay(
+    const StereoSystem &stereoSystem, 
+    const cv::Point2f &coordinate, 
+    int cameraID, 
+    cv::Point3f &origin, 
+    cv::Point3f &direction
+){
+    // 1. Choose camera parameters
+    cv::Mat K = (cameraID == 1) ? stereoSystem.K2 : stereoSystem.K1;
+    cv::Mat D = (cameraID == 1) ? stereoSystem.D2 : stereoSystem.D1;
+    cv::Mat R_cam = cv::Mat::eye(3, 3, CV_64F);
+    cv::Mat t_cam = cv::Mat::zeros(3, 1, CV_64F);
+
+    if (cameraID == 1) {
+        // For right camera, extrinsics transform from right camera to left camera/world
+        R_cam = stereoSystem.R.clone();
+        t_cam = stereoSystem.T.clone();
+    }
+
+    // 2. Undistort pixel to normalized image coordinates
+    std::vector<cv::Point2f> srcPt(1, coordinate), undistPt;
+    cv::undistortPoints(srcPt, undistPt, K, D);
+
+    // undistPt is in normalized camera coordinates (z=1)
+    cv::Point3f dirCam(undistPt[0].x, undistPt[0].y, 1.0f);
+
+    // 3. Transform ray to world/left camera space
+    cv::Mat dirCamMat = (cv::Mat_<double>(3, 1) << dirCam.x, dirCam.y, dirCam.z);
+    cv::Mat dirWorldMat = R_cam.t() * dirCamMat; // rotate to world
+    cv::Mat originWorldMat = -R_cam.t() * t_cam; // camera center in world
+
+    // 4. Normalize direction
+    cv::Point3f dirWorld(
+        (float)dirWorldMat.at<double>(0),
+        (float)dirWorldMat.at<double>(1),
+        (float)dirWorldMat.at<double>(2)
+    );
+    float len = std::sqrt(dirWorld.x*dirWorld.x + dirWorld.y*dirWorld.y + dirWorld.z*dirWorld.z);
+    dirWorld.x /= len;
+    dirWorld.y /= len;
+    dirWorld.z /= len;
+
+    cv::Point3f originWorld(
+        (float)originWorldMat.at<double>(0),
+        (float)originWorldMat.at<double>(1),
+        (float)originWorldMat.at<double>(2)
+    );
+
+    origin = originWorld;
+    direction = dirWorld;
+}
+
+bool validateStereoMatch(
+    cv::Point2f leftPoint, 
+    cv::Point2f rightPoint, 
+    float minZ, float maxZ, 
+    const StereoSystem& stereoSystem,
+    float maxYDiff
+) {
+    // Wrap pixel points into vector<cv::Point2f>
+    std::vector<cv::Point2f> ptsLeft = { leftPoint };
+    std::vector<cv::Point2f> ptsRight = { rightPoint };
+
+    // Undistort and rectify points
+    std::vector<cv::Point2f> rectLeft, rectRight;
+    cv::undistortPoints(ptsLeft, rectLeft, stereoSystem.K1, stereoSystem.D1, stereoSystem.R1, stereoSystem.P1);
+    cv::undistortPoints(ptsRight, rectRight, stereoSystem.K2, stereoSystem.D2, stereoSystem.R2, stereoSystem.P2);
+
+    // Check y-values for epipolar consistency
+    if (std::abs(rectLeft[0].y - rectRight[0].y) > maxYDiff) {
+        return false; // Not epipolar-consistent
+    }
+
+    // Triangulate the 3D point
+    cv::Mat point4D;
+    cv::triangulatePoints(stereoSystem.P1, stereoSystem.P2, rectLeft, rectRight, point4D);
+
+    // Convert from homogeneous coordinates to 3D
+    cv::Vec3f point3f(
+        point4D.at<float>(0) / point4D.at<float>(3),
+        point4D.at<float>(1) / point4D.at<float>(3),
+        point4D.at<float>(2) / point4D.at<float>(3)
+    );
+
+    // Check depth (Z) range
+    if (point3f[2] < minZ || point3f[2] > maxZ) {
+        return false;
+    }
+
+    // Passed all checks
+    return true;
+}
+
+void matchStereoPoints(
+    std::vector<cv::Point2f>& leftPoints,
+    std::vector<cv::Point2f>& rightPoints,
+    float minZ, float maxZ,
+    const StereoSystem& stereoSystem,
+    float maxYDiff
+) {
+    // Vectors to hold matched points
+    std::vector<cv::Point2f> matchedLeft, matchedRight;
+
+    // Keep track of which right points are already matched
+    std::vector<bool> rightMatched(rightPoints.size(), false);
+
+    for (const auto& lp : leftPoints) {
+        float bestDist = std::numeric_limits<float>::max();
+        int bestIdx = -1;
+
+        // Brute-force check against all unmatched right points
+        for (size_t j = 0; j < rightPoints.size(); ++j) {
+            if (rightMatched[j]) continue;
+
+            if (validateStereoMatch(lp, rightPoints[j], minZ, maxZ, stereoSystem, maxYDiff)) {
+                // Use simple horizontal distance as tie-breaker (optional)
+                float dx = lp.x - rightPoints[j].x;
+                float dy = lp.y - rightPoints[j].y;
+                float dist = dx*dx + dy*dy;
+
+                if (dist < bestDist) {
+                    bestDist = dist;
+                    bestIdx = (int)j;
+                }
+            }
+        }
+
+        // If a match was found, store it
+        if (bestIdx != -1) {
+            matchedLeft.push_back(lp);
+            matchedRight.push_back(rightPoints[bestIdx]);
+            rightMatched[bestIdx] = true; // mark as used
+        }
+    }
+
+    // Replace input vectors with matched pairs
+    leftPoints = matchedLeft;
+    rightPoints = matchedRight;
 }

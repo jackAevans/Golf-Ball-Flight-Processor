@@ -28,4 +28,28 @@ std::string serializeStereoSystem(const StereoSystem &stereoSystem);
 
 StereoSystem deserializeStereoSystem(const std::string &data);
 
-cv::Point3f triangulatePoint(cv::Point2d leftPoint, cv::Point2d rightPoint, const StereoSystem& stereoSystem);
+cv::Point3f triangulatePoint(cv::Point2f leftPoint, cv::Point2f rightPoint, const StereoSystem& stereoSystem);
+
+void getRay(
+    const StereoSystem &stereoSystem, 
+    const cv::Point2f &coordinate, 
+    int cameraID, 
+    cv::Point3f &origin, 
+    cv::Point3f &direction
+);
+
+bool validateStereoMatch(
+    cv::Point2f leftPoint, 
+    cv::Point2f rightPoint, 
+    float minZ, float maxZ, 
+    const StereoSystem& stereoSystem,
+    float maxYDiff = 3.0f 
+);
+
+void matchStereoPoints(
+    std::vector<cv::Point2f>& leftPoints,
+    std::vector<cv::Point2f>& rightPoints,
+    float minZ, float maxZ,
+    const StereoSystem& stereoSystem,
+    float maxYDiff = 3.0f
+);
